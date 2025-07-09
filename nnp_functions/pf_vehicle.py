@@ -1,10 +1,14 @@
-from .particle_filter import *
+from .particle_filter import ParticleFilter
 from .simulate_forward import *
 
 import jax
 import jax.numpy as jnp
-import polars as pl
+import jax.scipy as jsp
 import equinox as eqx
+from tqdm.notebook import tqdm
+
+from numpy.typing import ArrayLike
+
 
 class PFVehicle:
 
@@ -27,18 +31,15 @@ class PFVehicle:
 
         self.state_transition_single_weight = jax.jit(jax.vmap(state_transition_single_weight, in_axes=(0, 0, None, None)))
         self.state_observation_single_weight = jax.jit(jax.vmap(state_observation_single_weight, in_axes=(0, 0, None, None)))
-    
-    def generate_data(self, 
-                      key, 
-                      N_runs: int, 
-                      N_time_steps: int, 
-                      starting_point: float
-                      ):
+
+    def _generate_paths(self, 
+                        key,
+                        starting_points, 
+                        N_runs,
+                        N_time_steps):
+
         path_key, observation_key = jax.random.split(key, 2)
-
-        # Creating starting points.
-        starting_points = jnp.ones(N_runs) * starting_point
-
+        
         # Define state evolution functions
         def individual_jump_body(carry, noise):
             """Single step of state evolution"""
@@ -79,7 +80,18 @@ class PFVehicle:
         sampled_observation_paths = observation_scan_fn(sampled_forward_particles, observation_noise)
 
         return sampled_forward_particles, sampled_observation_paths
+    
+    def generate_data(self, 
+                      key, 
+                      N_runs: int, 
+                      N_time_steps: int, 
+                      starting_point: float
+                      ):
 
+        # Creating starting points.
+        starting_points = jnp.ones(N_runs) * starting_point
+
+        return self._generate_paths(key, starting_points, N_runs, N_time_steps)
 
     def generate_training_data(
             self, 
@@ -109,61 +121,127 @@ class PFVehicle:
 
         return batched_data  # shape: (N_batches, batch_size, 2), (N_batches, batch_size)  
 
+    def _simulate_forward(
+            self, 
+            key: jax.random.PRNGKey,
+            initial_particles: jnp.ndarray,
+            initial_log_weights: jnp.ndarray,
+            Y_array: jnp.ndarray,
+            tau: float,
+            n_particles: int = 2500
+    ):
+        print('In simulate forward, y_array is', Y_array.shape)
 
+        # 1. Prepare For the forward simulation. 
 
-    # def run_from_particle_filter(self,
-    #                            key: jax.random.PRNGKey,
-    #                            particle_filter: ParticleFilter,
-    #                            simulate_from_func: SimulatingForward = None,
-    #                            include_raw_paths: bool = False,
-    #                            break_after: int = -1,
-    #                            verbose: bool = True):
-    #     """
-    #     Run the complete particle filter pipeline.
+        key, sample_key = jax.random.split(key, 2)
+
+        # Sample starting points from initial particle distribution
+        starting_point_indices = jax.random.choice(
+            sample_key, initial_particles.shape[0], (n_particles,), 
+            p=jnp.exp(initial_log_weights)
+        )
+        starting_points = initial_particles[starting_point_indices]
+
+        # 2. Get the paths. 
+
+        sampled_forward_particles, sampled_observation_paths = self._generate_paths(
+            key,
+            starting_points,
+            n_particles,
+            Y_array.shape[0]
+        )
+
+        # 3. Get the likelihood and return the paths etc.
+
+        # Calculate realized volatility with time normalization
+        tau_normalized_constant = 1 / (Y_array.shape[0] * tau)
+        target_realized_vol = tau_normalized_constant * jnp.sum(Y_array**2)
+        sampled_realized_vol = tau_normalized_constant * jnp.sum(sampled_observation_paths**2, axis=1)
+
+        # Estimate likelihood using kernel density estimation
+        kde = jsp.stats.gaussian_kde(sampled_realized_vol, bw_method="scott")
+        likelihood = kde.logpdf(target_realized_vol)
+
+        return (sampled_forward_particles, sampled_observation_paths), likelihood
+
+    def run_from_particle_filter(self,
+                               key: jax.random.PRNGKey,
+                               particle_filter: ParticleFilter,
+                               data_tuple: tuple,
+                               initial_particles: jnp.ndarray,
+                               simulate_at: ArrayLike,
+                               tau: float,
+                               verbose: bool = True):
         
-    #     Args:
-    #         key: JAX random key for reproducibility
-    #         particle_filter: ParticleFilter instance to use
-    #         break_after: Maximum number of segments to process (-1 for all)
-    #         verbose: Whether to print progress information
+        adjusted_prediction_length = data_tuple[0].shape[0] - 1
+        forecast_at = [int(f_ratio * adjusted_prediction_length) for f_ratio in simulate_at]
+
+        Y_array, X_array = data_tuple
+        diagnostic_from_segment_dict = {}
+        particle_and_weights_at_flag_idx = {}
+        likelihood_list = []
+
+        output_diagnostics = particle_filter.category_two_metric_names + particle_filter.category_one_metric_names
+        merged_diagnostics = {
+            key: jnp.array([]) for key in output_diagnostics
+        }
+
+        start_idx = 0
+
+        # Initial particles and weights must be provided by the user (or set externally)
+        last_particles = initial_particles
+        last_weights = - jnp.log(particle_filter.N_PARTICLES) * jnp.ones_like(initial_particles)
+        
+        pbar = tqdm(forecast_at + [Y_array.shape[0]], desc="Processing segments", unit="segment")
+        print(forecast_at)
+
+        for forecast_idx in pbar:
+            key, forward_key, pf_step_key = jax.random.split(key, 3)
             
-    #     Returns:
-    #         Tuple of (final_diagnostics, final_fit_metrics)
-    #     """
-    #     # Split key for separate processing and forward simulation
-    #     processing_key, forward_key = jax.random.split(key)
-        
-    #     # Run particle filtering
-    #     diagnostic_from_segment_dict, particle_and_weights_at_flag_idx = processing(
-    #         processing_key, 
-    #         particle_filter, 
-    #         self.pre_processed_data_base, 
-    #         self.initial_particles_weights, 
-    #         break_after, 
-    #         verbose
-    #     )
-        
-    #     # Run forward simulations
+            # 1. Run the particle filter.
 
-    #     if simulate_from_func is None:
-    #         simulate_from_func = self.simulate_from_func
+            pf_Y_segment = Y_array[start_idx:forecast_idx]
+            pf_X_segment = X_array[start_idx:forecast_idx]
 
-    #     raw_path_dict, raw_fit_metrics = simulate_forward_processing(
-    #         forward_key, 
-    #         simulate_from_func, 
-    #         self.pre_processed_data_base, 
-    #         particle_and_weights_at_flag_idx, 
-    #         self.forecast_negative_increments, 
-    #         break_after, 
-    #         verbose
-    #     )
+            print(len(pf_Y_segment))
+
+            out_particles, out_weights, diagnostics = particle_filter.simulate(
+                pf_step_key,
+                last_particles,
+                last_weights,
+                pf_Y_segment,
+                pf_X_segment
+            )
+            
+            diagnostic_from_segment_dict[forecast_idx] = diagnostics
+            particle_and_weights_at_flag_idx[forecast_idx] = (out_particles, out_weights)
+            
+            merged_diagnostics = {
+                key: jnp.concatenate([merged_diagnostics[key], diagnostics[key]])
+                for key in output_diagnostics
+            }
+            
+            last_particles = out_particles
+            last_weights = out_weights
+
+            
+            # 2. Simulate forward.
+
+            pf_Y_segment = Y_array[forecast_idx + 1:]
+            (sampled_forward_particles, sampled_observation_paths), likelihood = self._simulate_forward(
+                forward_key,
+                out_particles,
+                out_weights,
+                pf_Y_segment,
+                tau
+            )
+
+            # 3. Process the outputs
+            merged_diagnostics[forecast_idx] = (sampled_forward_particles, sampled_observation_paths)
+            likelihood_list.append(likelihood)
+
+            # Next segment.
+            start_idx = forecast_idx
         
-    #     # Apply final processing step
-    #     final_diagnostic_from_segment_dict, final_raw_fit_metrics = self.final_step_processing(
-    #         diagnostic_from_segment_dict, 
-    #         raw_fit_metrics
-    #     )
-    #     if include_raw_paths:
-    #         return final_diagnostic_from_segment_dict, final_raw_fit_metrics, raw_path_dict
-    #     else:
-    #         return final_diagnostic_from_segment_dict, final_raw_fit_metrics
+        return merged_diagnostics, particle_and_weights_at_flag_idx, likelihood_list
