@@ -165,83 +165,96 @@ class PFVehicle:
 
         return (sampled_forward_particles, sampled_observation_paths), likelihood
 
-    def run_from_particle_filter(self,
-                               key: jax.random.PRNGKey,
-                               particle_filter: ParticleFilter,
-                               data_tuple: tuple,
-                               initial_particles: jnp.ndarray,
-                               simulate_at: ArrayLike,
-                               tau: float,
-                               verbose: bool = True):
-        
-        adjusted_prediction_length = data_tuple[0].shape[0] - 1
+    def run_from_particle_filter(
+        self,
+        key: jax.random.PRNGKey,
+        particle_filter: ParticleFilter,
+        data_tuple: tuple,
+        initial_particles: jnp.ndarray,
+        simulate_at: ArrayLike,
+        tau: float,
+        verbose: bool = True
+    ):
+        """
+        Runs a particle filter in segments, simulates forward, and collects diagnostics.
+
+        Args:
+            key: JAX random key.
+            particle_filter: ParticleFilter instance.
+            data_tuple: Tuple of (X_array, Y_array).
+            initial_particles: Initial particle states.
+            simulate_at: List/array of fractions (0-1) indicating forecast points.
+            tau: Time normalization constant.
+            verbose: If True, show progress bar.
+
+        Returns:
+            merged_diagnostics: Dict of concatenated diagnostics.
+            particle_and_weights_at_flag_idx: Dict of (particles, weights) at each segment.
+            likelihood_list: List of forward simulation likelihoods.
+        """
+        X_array, Y_array = data_tuple
+        adjusted_prediction_length = X_array.shape[0] - 1
         forecast_at = [int(f_ratio * adjusted_prediction_length) for f_ratio in simulate_at]
 
-        Y_array, X_array = data_tuple
+        output_diagnostics = (
+            particle_filter.category_two_metric_names + particle_filter.category_one_metric_names
+        )
+        merged_diagnostics = {k: jnp.array([]) for k in output_diagnostics}
         diagnostic_from_segment_dict = {}
         particle_and_weights_at_flag_idx = {}
         likelihood_list = []
 
-        output_diagnostics = particle_filter.category_two_metric_names + particle_filter.category_one_metric_names
-        merged_diagnostics = {
-            key: jnp.array([]) for key in output_diagnostics
-        }
-
         start_idx = 0
-
-        # Initial particles and weights must be provided by the user (or set externally)
         last_particles = initial_particles
-        last_weights = - jnp.log(particle_filter.N_PARTICLES) * jnp.ones_like(initial_particles)
-        
-        pbar = tqdm(forecast_at + [Y_array.shape[0]], desc="Processing segments", unit="segment")
-        print(forecast_at)
+        last_weights = -jnp.log(particle_filter.N_PARTICLES) * jnp.ones_like(initial_particles)
+
+        pbar = tqdm(forecast_at, desc="Processing segments", unit="segment") if verbose else forecast_at
 
         for forecast_idx in pbar:
             key, forward_key, pf_step_key = jax.random.split(key, 3)
-            
-            # 1. Run the particle filter.
 
+            # Particle filter segment
             pf_Y_segment = Y_array[start_idx:forecast_idx]
             pf_X_segment = X_array[start_idx:forecast_idx]
 
-            print(len(pf_Y_segment))
-
             out_particles, out_weights, diagnostics = particle_filter.simulate(
-                pf_step_key,
-                last_particles,
-                last_weights,
-                pf_Y_segment,
-                pf_X_segment
+                pf_step_key, last_particles, last_weights, pf_Y_segment, pf_X_segment
             )
-            
+
             diagnostic_from_segment_dict[forecast_idx] = diagnostics
             particle_and_weights_at_flag_idx[forecast_idx] = (out_particles, out_weights)
-            
             merged_diagnostics = {
-                key: jnp.concatenate([merged_diagnostics[key], diagnostics[key]])
-                for key in output_diagnostics
+                k: jnp.concatenate([merged_diagnostics[k], diagnostics[k]])
+                for k in output_diagnostics
             }
-            
-            last_particles = out_particles
-            last_weights = out_weights
 
-            
-            # 2. Simulate forward.
+            last_particles, last_weights = out_particles, out_weights
 
-            pf_Y_segment = Y_array[forecast_idx + 1:]
+            # Forward simulation
+            pf_Y_forward = Y_array[forecast_idx + 1 :]
             (sampled_forward_particles, sampled_observation_paths), likelihood = self._simulate_forward(
-                forward_key,
-                out_particles,
-                out_weights,
-                pf_Y_segment,
-                tau
+                forward_key, out_particles, out_weights, pf_Y_forward, tau
             )
 
-            # 3. Process the outputs
             merged_diagnostics[forecast_idx] = (sampled_forward_particles, sampled_observation_paths)
             likelihood_list.append(likelihood)
 
-            # Next segment.
-            start_idx = forecast_idx
-        
+            start_idx = forecast_idx + 1
+
+        # Final segment
+        pf_Y_segment = Y_array[start_idx:]
+        pf_X_segment = X_array[start_idx:]
+
+        out_particles, out_weights, diagnostics = particle_filter.simulate(
+            pf_step_key, last_particles, last_weights, pf_Y_segment, pf_X_segment
+        )
+
+        merged_diagnostics[forecast_idx] = (out_particles, out_weights)
+        diagnostic_from_segment_dict[forecast_idx] = diagnostics
+        particle_and_weights_at_flag_idx[forecast_idx] = (out_particles, out_weights)
+        merged_diagnostics = {
+            k: jnp.concatenate([merged_diagnostics[k], diagnostics[k]])
+            for k in output_diagnostics
+        }
+
         return merged_diagnostics, particle_and_weights_at_flag_idx, likelihood_list
