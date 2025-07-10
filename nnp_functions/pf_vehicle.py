@@ -1,5 +1,4 @@
 from .particle_filter import ParticleFilter
-from .simulate_forward import *
 
 import jax
 import optax
@@ -371,27 +370,11 @@ class PFVehicle:
         # Calculating coverage
         lower_quantile = jnp.quantile(sampled_forward_particles, 0.2, axis=0)
         upper_quantile = jnp.quantile(sampled_forward_particles, 0.8, axis=0)
-        forecast_metrics['total_coverage'] = jnp.mean((X_array > lower_quantile) & (X_array < upper_quantile))
+        forecast_metrics['total_coverage'] = jnp.abs(0.6 - jnp.mean((X_array > lower_quantile) & (X_array < upper_quantile)))
 
         # 4. 
 
         return (sampled_forward_particles, sampled_observation_paths), forecast_metrics
-
-
-    def run_many_from_particle_filter(
-            self,
-            key: jax.random.PRNGKey,
-            particle_filter: ParticleFilter,
-            Y_array: jnp.ndarray,
-            X_array: jnp.ndarray,
-            initial_particles: jnp.ndarray,
-            simulate_at: ArrayLike,
-            tau: float,
-    ):
-        # This will need to be adapted to be able to vmap.
-        return jax.vmap(self.run_from_particle_filter, in_axes=(0, None, 0, 0, None, None, None))(
-            key, particle_filter, Y_array, X_array, initial_particles, simulate_at, tau
-        )
         
 
     def run_from_particle_filter(
@@ -403,6 +386,7 @@ class PFVehicle:
         initial_particles: jnp.ndarray,
         simulate_at: ArrayLike,
         tau: float,
+        n_sample_particles: int = 2500,
         verbose: bool = True
     ):
         """
@@ -463,7 +447,7 @@ class PFVehicle:
             pf_Y_forward = Y_array[forecast_idx + 1 :]
             pf_X_forward = X_array[forecast_idx + 1 :]
             (sampled_forward_particles, sampled_observation_paths), forecast_metric_dict = self._simulate_forward(
-                forward_key, out_particles, out_weights, pf_Y_forward, pf_X_forward, tau
+                forward_key, out_particles, out_weights, pf_Y_forward, pf_X_forward, tau, n_particles=n_sample_particles
             )
 
             merged_diagnostics[f"forward_sim_{forecast_idx}"] = (sampled_forward_particles, sampled_observation_paths)
