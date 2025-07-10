@@ -12,7 +12,6 @@ from numpy.typing import ArrayLike
 
 
 class PFVehicle:
-
     def __init__(self, 
                  #initial_model: eqx.Module,
                  f_from_noise: callable,
@@ -374,6 +373,23 @@ class PFVehicle:
         # 4. 
 
         return (sampled_forward_particles, sampled_observation_paths), forecast_metrics
+
+
+    def run_many_from_particle_filter(
+            self,
+            key: jax.random.PRNGKey,
+            particle_filter: ParticleFilter,
+            Y_array: jnp.ndarray,
+            X_array: jnp.ndarray,
+            initial_particles: jnp.ndarray,
+            simulate_at: ArrayLike,
+            tau: float,
+    ):
+        # This will need to be adapted to be able to vmap.
+        return jax.vmap(self.run_from_particle_filter, in_axes=(0, None, 0, 0, None, None, None))(
+            key, particle_filter, Y_array, X_array, initial_particles, simulate_at, tau
+        )
+        
 
     def run_from_particle_filter(
         self,
