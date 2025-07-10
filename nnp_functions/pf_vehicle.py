@@ -30,8 +30,8 @@ class PFVehicle:
         self.f_from_noise = f_from_noise
         self.g_from_noise = g_from_noise
 
-        self.state_transition_single_weight = jax.jit(jax.vmap(state_transition_single_weight, in_axes=(0, 0, None, None)))
-        self.state_observation_single_weight = jax.jit(jax.vmap(state_observation_single_weight, in_axes=(0, 0, None, None)))
+        self.state_transition_weight = jax.jit(jax.vmap(state_transition_single_weight, in_axes=(0, 0, None, None)))
+        self.state_observation_weight = jax.jit(jax.vmap(state_observation_single_weight, in_axes=(0, 0, None, None)))
 
     def _generate_paths(self, 
                         key,
@@ -241,6 +241,79 @@ class PFVehicle:
         self.losses = losses
         self.test_losses = test_losses
     
+    @staticmethod
+    def model_sample_from_inputs(model, subkey, inputs):
+        means, stds = jnp.array(model(inputs))
+        return jax.random.normal(subkey, means.shape) * stds + means
+    
+    @staticmethod
+    def model_weight_from_inputs(model, particles, inputs):
+        means, stds = jnp.array(model(inputs))
+        return jax.scipy.stats.norm.logpdf(particles, loc=means, scale=stds)
+
+    def build_NN_particle_filter(
+            self,
+            **kwargs
+    ):
+        
+        if self.has_trained_flag is False:
+            raise ValueError("Model has not been trained yet.")
+
+        def build_model_inputs(prev_particles, Y_array, idt):
+            new_col = jnp.full((prev_particles.shape[0], 1), Y_array.at[idt].get())
+            model_input_i = jnp.hstack((prev_particles.reshape(-1, 1), new_col))
+            return model_input_i  
+        
+        def NN_weight_fn(particles, prev_particles, Y_array, idt): 
+            """
+            Calculate particle weights using the neural network proposal.
+            
+            Args:
+                Y_i: Current observation
+                particles: Current state particles
+                prev_particles: Previous state particles
+                
+            Returns:
+                array: Log weights for each particle
+            """
+            # Calculate observation likelihood
+            # I have to change this to be the leverage model, but can I just input the leverage_bootstrap_weight?
+            g_y_i_from_x_i = self.state_observation_weight(particles, prev_particles, Y_array, idt)
+            
+            # Calculate transition likelihood
+            f_x_i_from_x_prev_i = self.state_transition_weight(particles, prev_particles, Y_array, idt)
+            
+            # Calculate proposal likelihood
+            inputs = build_model_inputs(prev_particles, Y_array, idt)
+            q_x_i_from_x_prev_i_y_i = self.model_weight_from_inputs(self.trained_model, particles, inputs)
+
+            # Return log weight: log(g) + log(f) - log(q)
+            return g_y_i_from_x_i + f_x_i_from_x_prev_i - q_x_i_from_x_prev_i_y_i
+        
+        def NN_sample_fn(subkey, prev_particles, Y_array, idt):
+            """
+            Sample new particles using the neural network proposal.
+            
+            Args:
+                subkey: JAX random key
+                particles: Current state particles
+                Y_i: Current observation
+                
+            Returns:
+                array: New sampled particles
+            """
+            inputs = build_model_inputs(prev_particles, Y_array, idt)
+            new_particles = self.model_sample_from_inputs(self.trained_model, subkey, inputs)
+
+            return new_particles
+        
+        self.NN_particle_filter = ParticleFilter(
+            sample_fn=NN_sample_fn,
+            weight_fn=NN_weight_fn,
+            **kwargs
+        )
+
+        return self.NN_particle_filter
 
 
     def _simulate_forward(
@@ -388,8 +461,8 @@ class PFVehicle:
             final_pf_key, last_particles, last_weights, pf_Y_segment, pf_X_segment
         )
 
-        diagnostic_from_segment_dict["final"] = diagnostics
-        particle_and_weights_at_flag_idx["final"] = (out_particles, out_weights)
+        diagnostic_from_segment_dict[-1] = diagnostics
+        particle_and_weights_at_flag_idx[-1] = (out_particles, out_weights)
         
         merged_diagnostics = {
             k: jnp.concatenate([merged_diagnostics[k], diagnostics[k]])
