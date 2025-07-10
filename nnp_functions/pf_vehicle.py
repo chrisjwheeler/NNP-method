@@ -127,10 +127,10 @@ class PFVehicle:
             initial_particles: jnp.ndarray,
             initial_log_weights: jnp.ndarray,
             Y_array: jnp.ndarray,
+            X_array: jnp.ndarray,
             tau: float,
             n_particles: int = 2500
     ):
-        print('In simulate forward, y_array is', Y_array.shape)
 
         # 1. Prepare For the forward simulation. 
 
@@ -152,7 +152,8 @@ class PFVehicle:
             Y_array.shape[0]
         )
 
-        # 3. Get the likelihood and return the paths etc.
+        # 3. Calculate metrics on the paths. 
+        forecast_metrics = {}
 
         # Calculate realized volatility with time normalization
         tau_normalized_constant = 1 / (Y_array.shape[0] * tau)
@@ -161,15 +162,30 @@ class PFVehicle:
 
         # Estimate likelihood using kernel density estimation
         kde = jsp.stats.gaussian_kde(sampled_realized_vol, bw_method="scott")
-        likelihood = kde.logpdf(target_realized_vol)
+        forecast_metrics['likelihood'] = kde.logpdf(target_realized_vol)
 
-        return (sampled_forward_particles, sampled_observation_paths), likelihood
+        kde_mse = jnp.mean((sampled_realized_vol - target_realized_vol)**2)
+        forecast_metrics['kde_mse'] = kde_mse
+
+        # Calculating the mean squared error. 
+        total_mse = jnp.mean((sampled_forward_particles - X_array)**2)
+        forecast_metrics['total_mse'] = total_mse
+
+        # Calculating coverage
+        lower_quantile = jnp.quantile(sampled_forward_particles, 0.2, axis=0)
+        upper_quantile = jnp.quantile(sampled_forward_particles, 0.8, axis=0)
+        forecast_metrics['total_coverage'] = jnp.mean((X_array > lower_quantile) & (X_array < upper_quantile))
+
+        # 4. 
+
+        return (sampled_forward_particles, sampled_observation_paths), forecast_metrics
 
     def run_from_particle_filter(
         self,
         key: jax.random.PRNGKey,
         particle_filter: ParticleFilter,
-        data_tuple: tuple,
+        Y_array: jnp.ndarray,
+        X_array: jnp.ndarray,
         initial_particles: jnp.ndarray,
         simulate_at: ArrayLike,
         tau: float,
@@ -190,9 +206,8 @@ class PFVehicle:
         Returns:
             merged_diagnostics: Dict of concatenated diagnostics.
             particle_and_weights_at_flag_idx: Dict of (particles, weights) at each segment.
-            likelihood_list: List of forward simulation likelihoods.
+            total_forecast_metrics: Dict of forward simulation metrics at each segment.
         """
-        X_array, Y_array = data_tuple
         adjusted_prediction_length = X_array.shape[0] - 1
         forecast_at = [int(f_ratio * adjusted_prediction_length) for f_ratio in simulate_at]
 
@@ -202,7 +217,7 @@ class PFVehicle:
         merged_diagnostics = {k: jnp.array([]) for k in output_diagnostics}
         diagnostic_from_segment_dict = {}
         particle_and_weights_at_flag_idx = {}
-        likelihood_list = []
+        total_forecast_metrics = {}
 
         start_idx = 0
         last_particles = initial_particles
@@ -232,29 +247,31 @@ class PFVehicle:
 
             # Forward simulation
             pf_Y_forward = Y_array[forecast_idx + 1 :]
-            (sampled_forward_particles, sampled_observation_paths), likelihood = self._simulate_forward(
-                forward_key, out_particles, out_weights, pf_Y_forward, tau
+            pf_X_forward = X_array[forecast_idx + 1 :]
+            (sampled_forward_particles, sampled_observation_paths), forecast_metric_dict = self._simulate_forward(
+                forward_key, out_particles, out_weights, pf_Y_forward, pf_X_forward, tau
             )
 
-            merged_diagnostics[forecast_idx] = (sampled_forward_particles, sampled_observation_paths)
-            likelihood_list.append(likelihood)
+            merged_diagnostics[f"forward_sim_{forecast_idx}"] = (sampled_forward_particles, sampled_observation_paths)
+            total_forecast_metrics[forecast_idx] = forecast_metric_dict
 
             start_idx = forecast_idx + 1
 
         # Final segment
+        key, final_pf_key = jax.random.split(key, 2)
         pf_Y_segment = Y_array[start_idx:]
         pf_X_segment = X_array[start_idx:]
 
         out_particles, out_weights, diagnostics = particle_filter.simulate(
-            pf_step_key, last_particles, last_weights, pf_Y_segment, pf_X_segment
+            final_pf_key, last_particles, last_weights, pf_Y_segment, pf_X_segment
         )
 
-        merged_diagnostics[forecast_idx] = (out_particles, out_weights)
-        diagnostic_from_segment_dict[forecast_idx] = diagnostics
-        particle_and_weights_at_flag_idx[forecast_idx] = (out_particles, out_weights)
+        diagnostic_from_segment_dict["final"] = diagnostics
+        particle_and_weights_at_flag_idx["final"] = (out_particles, out_weights)
+        
         merged_diagnostics = {
             k: jnp.concatenate([merged_diagnostics[k], diagnostics[k]])
             for k in output_diagnostics
         }
 
-        return merged_diagnostics, particle_and_weights_at_flag_idx, likelihood_list
+        return merged_diagnostics, particle_and_weights_at_flag_idx, total_forecast_metrics
