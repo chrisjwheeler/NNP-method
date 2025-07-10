@@ -314,6 +314,9 @@ class PFVehicle:
 
         return self.NN_particle_filter
 
+    def reset_model(self,):
+        self.model = None
+        self.has_trained_flag = False
 
     def _simulate_forward(
             self, 
