@@ -2,11 +2,12 @@ from .particle_filter import ParticleFilter
 from .simulate_forward import *
 
 import jax
+import optax
 import jax.numpy as jnp
 import jax.scipy as jsp
 import equinox as eqx
 from tqdm.notebook import tqdm
-
+import matplotlib.pyplot as plt
 from numpy.typing import ArrayLike
 
 
@@ -120,6 +121,127 @@ class PFVehicle:
         batched_data = jax.vmap(generate_batch)(all_X_vals, all_Y_vals)
 
         return batched_data  # shape: (N_batches, batch_size, 2), (N_batches, batch_size)  
+
+    def train_model(
+            self, 
+            key: jax.random.PRNGKey,
+            initial_model: eqx.Module,
+            batch_size: int,
+            training_params: tuple[int, int] = (1000, 5000),
+            testing_params: tuple[int, int] = (100, 2500),
+            learning_rate: float = 1e-3,
+            steps: int = 1000,
+            eval_frequency: int = 100,
+            X_bar: float = 0.0,
+            verbose: bool = True,
+            transition_model: callable = None
+            ):
+
+
+        train_key, data_key, test_data_key = jax.random.split(key, 3)
+
+        input_batches, target_batches = self.generate_training_data(
+            data_key, 
+            training_params[0], 
+            training_params[1],
+            X_bar
+        )
+
+        inputs = jnp.vstack(input_batches)
+        targets = jnp.hstack(target_batches)
+
+        test_input_batches, test_target_batches = self.generate_training_data(
+            test_data_key, 
+            testing_params[0], 
+            testing_params[1],
+            X_bar
+        )
+
+        test_inputs = jnp.vstack(test_input_batches)
+        test_targets = jnp.hstack(test_target_batches)
+
+        model = initial_model
+
+        optimizer = optax.adam(learning_rate=learning_rate)
+        opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+        
+        @eqx.filter_value_and_grad
+        def loss(model, inputs, z_i):
+            pred_mean, pred_std = jax.vmap(model)(inputs)
+            log_likelihood = jax.scipy.stats.norm.logpdf(z_i, loc=pred_mean, scale=pred_std)
+            return -jnp.mean(log_likelihood)
+
+        @eqx.filter_jit
+        def batched_train_step(model, x, y, opt_state, optimizer):
+            neg_ll, grads = loss(model, x, y)
+            updates, opt_state = optimizer.update(grads, opt_state)
+            model = eqx.apply_updates(model, updates)
+            return model, opt_state, neg_ll
+
+        @eqx.filter_jit
+        def evaluate(model, x, y):
+            return loss(model, x, y)
+
+        losses = []
+        test_losses = []
+        loop = tqdm(range(steps))
+
+        shuffle_key, train_key = jax.random.split(train_key)
+        shuffled_ix = jax.random.permutation(shuffle_key, inputs.shape[0])
+
+        batch_ix = 0
+        for step in loop:
+            if (batch_ix + 1) * batch_size > inputs.shape[0]:
+                shuffle_key, train_key = jax.random.split(train_key)
+                shuffled_ix = jax.random.permutation(shuffle_key, inputs.shape[0])
+                batch_ix = 0
+            
+            batch_idx = shuffled_ix[batch_ix * batch_size:(batch_ix + 1) * batch_size]
+            batch_ix += 1
+
+            model, opt_state, neg_ll = batched_train_step(
+                model, inputs[batch_idx], targets[batch_idx], opt_state, optimizer
+            )
+            losses.append(neg_ll)
+            
+            # Evaluate on test set periodically
+            if step % eval_frequency == 0:
+                test_loss = evaluate(model, test_inputs, test_targets)
+                test_losses.append(test_loss)
+                loop.set_postfix({
+                    'train_loss': f'{neg_ll:.4f}',
+                    'test_loss': f'{test_loss[0]:.4f}',
+                    'step': step
+                })
+            else:
+                loop.set_postfix({'train_loss': f'{neg_ll:.4f}', 'step': step})
+
+        if verbose:
+            plt.figure(figsize=(8, 3))
+            plt.plot(losses)
+            plt.axhline(test_loss[0], linestyle='--', c='green', label=f'test_loss: {test_loss[0]:.4f}')
+
+            if transition_model is not None:
+                transition_loss, _ = loss(transition_model, test_inputs, test_targets)
+                plt.axhline(transition_loss, linestyle='--', c='black', label=f'transition_loss: {transition_loss:.4f}')
+
+            plt.xlabel('steps')
+            plt.ylabel('neg ll')
+            # Set y-limits based on the bottom 20% quantile of the losses
+            lower = jnp.quantile(jnp.array(losses), 0.0)
+            upper = jnp.quantile(jnp.array(losses), 0.5)
+            plt.ylim([lower, upper])
+            plt.legend()
+            plt.grid()
+            plt.show()
+
+        self.has_trained_flag = True
+        self.trained_model = jax.vmap(model)
+        
+        self.losses = losses
+        self.test_losses = test_losses
+    
+
 
     def _simulate_forward(
             self, 
