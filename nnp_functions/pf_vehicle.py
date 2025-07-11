@@ -12,7 +12,6 @@ from numpy.typing import ArrayLike
 
 class PFVehicle:
     def __init__(self, 
-                 #initial_model: eqx.Module,
                  f_from_noise: callable,
                  g_from_noise: callable,
                  state_transition_single_weight: callable,

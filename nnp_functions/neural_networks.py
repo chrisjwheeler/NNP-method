@@ -22,4 +22,4 @@ class FeedForwardNetwork(eqx.Module):
         x = self.layers[-1](x)
         mean, log_std = x[0], x[1]
         std = jax.nn.softplus(log_std) + 1e-24
-        return [mean, std]
+        return mean, std
