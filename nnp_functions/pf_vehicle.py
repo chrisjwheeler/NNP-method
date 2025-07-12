@@ -226,11 +226,12 @@ class PFVehicle:
             plt.ylabel('neg ll')
             # Set y-limits based on the bottom 20% quantile of the losses
             lower = jnp.quantile(jnp.array(losses), 0.0)
-            upper = jnp.quantile(jnp.array(losses), 0.5)
+            upper = jnp.quantile(jnp.array(losses), 0.95)
             plt.ylim([lower, upper])
             plt.legend()
             plt.grid()
             plt.show()
+            plt.close()
 
         self.has_trained_flag = True
         self.trained_model = jax.vmap(model)
