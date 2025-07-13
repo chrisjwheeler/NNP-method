@@ -118,6 +118,8 @@ class PFVehicle:
         batched_data = jax.vmap(generate_batch)(all_X_vals, all_Y_vals)
 
         return batched_data  # shape: (N_batches, batch_size, 2), (N_batches, batch_size)  
+    
+
 
     def train_model(
             self, 
@@ -164,10 +166,9 @@ class PFVehicle:
         
         @eqx.filter_value_and_grad
         def loss(model, inputs, z_i):
-            pred_mean, pred_std = jax.vmap(model)(inputs)
-            log_likelihood = jax.scipy.stats.norm.logpdf(z_i, loc=pred_mean, scale=pred_std)
+            log_likelihood = jax.vmap(self.model_weight_from_inputs, in_axes=(None, 0, 0))(model, z_i, inputs)
             return -jnp.mean(log_likelihood)
-
+        
         @eqx.filter_jit
         def batched_train_step(model, x, y, opt_state, optimizer):
             neg_ll, grads = loss(model, x, y)
@@ -234,6 +235,7 @@ class PFVehicle:
             plt.close()
 
         self.has_trained_flag = True
+        self.unvectorized_model = model
         self.trained_model = jax.vmap(model)
         
         self.losses = losses
