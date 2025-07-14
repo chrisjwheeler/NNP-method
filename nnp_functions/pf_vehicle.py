@@ -15,14 +15,14 @@ class PFVehicle:
                  f_from_noise: callable,
                  g_from_noise: callable,
                  state_transition_single_weight: callable,
-                 state_observation_single_weight: callable):
+                 state_observation_single_weight: callable,
+                 loss_function: callable = None):
 
 
         '''Both data generation should be partialed so that we dont handel the function passing inside the class.
         state and observation should be for singles. '''
         
-        #self.initial_model = initial_model
-        #self.model = initial_model
+        self.loss_function = loss_function
             
         self.f_from_noise = f_from_noise
         self.g_from_noise = g_from_noise
@@ -75,7 +75,9 @@ class PFVehicle:
             return hidden_state_evolution
 
         observation_noise = jax.random.normal(observation_key, sampled_forward_particles.shape)
-        sampled_observation_paths = observation_scan_fn(sampled_forward_particles, observation_noise)
+        sampled_observation_paths = jax.vmap(observation_scan_fn)(
+                sampled_forward_particles, observation_noise
+            )
 
         return sampled_forward_particles, sampled_observation_paths
     
@@ -106,7 +108,7 @@ class PFVehicle:
             true_X = X_vals[1:]
 
             Y_vals = Y_vals[1:]
-
+            
             assert len(prev_X) == len(true_X) == len(Y_vals), "Length mismatch in data preparation"
             
             input_data = jnp.stack([prev_X, Y_vals], axis=-1)  # shape: (batch_size, 2)
@@ -169,6 +171,16 @@ class PFVehicle:
             log_likelihood = jax.vmap(self.model_weight_from_inputs, in_axes=(None, 0, 0))(model, z_i, inputs)
             return -jnp.mean(log_likelihood)
         
+        @eqx.filter_value_and_grad
+        def default_loss(model, inputs, z_i):
+            log_likelihood = jax.vmap(self.model_weight_from_inputs, in_axes=(None, 0, 0))(model, z_i, inputs)
+            return -jnp.mean(log_likelihood)
+        
+        if self.loss_function == None:
+            loss = default_loss
+        else:
+            loss = self.loss_function
+        
         @eqx.filter_jit
         def batched_train_step(model, x, y, opt_state, optimizer):
             neg_ll, grads = loss(model, x, y)
@@ -178,7 +190,7 @@ class PFVehicle:
 
         @eqx.filter_jit
         def evaluate(model, x, y):
-            return loss(model, x, y)
+            return default_loss(model, x, y)
 
         losses = []
         test_losses = []
@@ -205,14 +217,16 @@ class PFVehicle:
             # Evaluate on test set periodically
             if step % eval_frequency == 0:
                 test_loss = evaluate(model, test_inputs, test_targets)
+                other_loss = default_loss(model, test_inputs, test_targets)
                 test_losses.append(test_loss)
                 loop.set_postfix({
                     'train_loss': f'{neg_ll:.4f}',
                     'test_loss': f'{test_loss[0]:.4f}',
+                    'other_loss': f'{other_loss[0]:.4f}',
                     'step': step
                 })
             else:
-                loop.set_postfix({'train_loss': f'{neg_ll:.4f}', 'step': step})
+                loop.set_postfix({'train_loss': f'{neg_ll:.4f}', 'step': step, 'default_loss': f'{other_loss[0]:.4f}'})
 
         if verbose:
             plt.figure(figsize=(8, 3))
