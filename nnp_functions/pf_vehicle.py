@@ -85,11 +85,15 @@ class PFVehicle:
                       key, 
                       N_runs: int, 
                       N_time_steps: int, 
-                      starting_point: float
+                      starting_point: float,
+                      noise_starting_scale: float = 0.0
                       ):
 
+        # hard code the noise key.
+        noise_key = jax.random.key(100)
+
         # Creating starting points.
-        starting_points = jnp.ones(N_runs) * starting_point
+        starting_points = jnp.ones(N_runs) * starting_point + jax.random.normal(noise_key, (N_runs,)) * noise_starting_scale
 
         return self._generate_paths(key, starting_points, N_runs, N_time_steps)
 
@@ -98,10 +102,11 @@ class PFVehicle:
             key: jax.random.PRNGKey, 
             N_batches: int, 
             batch_size: int,
-            starting_point: float
+            starting_point: float,
+            noise_starting_scale: float = 0.0
         ):
 
-        all_X_vals, all_Y_vals = self.generate_data(key, N_batches, batch_size, starting_point)
+        all_X_vals, all_Y_vals = self.generate_data(key, N_batches, batch_size, starting_point, noise_starting_scale)
         
         def generate_batch(X_vals, Y_vals):
             prev_X = X_vals[:-1]
@@ -135,7 +140,8 @@ class PFVehicle:
             eval_frequency: int = 100,
             X_bar: float = 0.0,
             verbose: bool = True,
-            transition_model: callable = None
+            transition_model: callable = None,
+            **kwargs
             ):
 
 
@@ -145,7 +151,8 @@ class PFVehicle:
             data_key, 
             training_params[0], 
             training_params[1],
-            X_bar
+            X_bar,
+            **kwargs
         )
 
         inputs = jnp.vstack(input_batches)
@@ -155,11 +162,18 @@ class PFVehicle:
             test_data_key, 
             testing_params[0], 
             testing_params[1],
-            X_bar
+            X_bar,
+            **kwargs
         )
 
         test_inputs = jnp.vstack(test_input_batches)
         test_targets = jnp.hstack(test_target_batches)
+
+        assert not jnp.isnan(inputs).any(), "NaNs found in training inputs"
+        assert not jnp.isnan(targets).any(), "NaNs found in training targets"
+
+        assert not jnp.isnan(test_inputs).any(), "NaNs found in test inputs"
+        assert not jnp.isnan(test_targets).any(), "NaNs found in test targets"
 
         model = initial_model
 
