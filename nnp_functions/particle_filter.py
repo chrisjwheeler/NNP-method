@@ -76,6 +76,7 @@ class ParticleFilter:
     Y_LOOK_FORWARD: int = 0
     switch_resampling_in_step: bool = False
     needs_final_reweight: bool = False
+    include_all_weights: bool = False
 
     def __post_init__(self):
 
@@ -220,6 +221,7 @@ class ParticleFilter:
 
             # IF IMPLEMENTING AUX: THIS SHOULD HAPPEN BEFORE RESAMPLING
             category_one_metric_args = self.get_category_one_metrics(true_X_val, sampled_particles, log_weights, unormalised_log_weights, self.N_PARTICLES)
+            untouched_weights_particles = (sampled_particles, jnp.exp(log_weights))
 
             if not self.switch_resampling_in_step:
                 key, subkey = jax.random.split(key)
@@ -233,7 +235,12 @@ class ParticleFilter:
                 )
                 particles = sampled_particles[particle_indices]
 
-            return (key, Y_array, particles, log_weights), (ess, resample_flag, *category_two_metric_args, *category_one_metric_args)
+            if self.include_all_weights:
+                non_carry_output = (untouched_weights_particles, ess, resample_flag, *category_two_metric_args, *category_one_metric_args)
+            else:
+                non_carry_output = (ess, resample_flag, *category_two_metric_args, *category_one_metric_args)
+
+            return (key, Y_array, particles, log_weights), non_carry_output
         
         # 1. Run scan.
 
@@ -246,6 +253,10 @@ class ParticleFilter:
             (Y_idt, X_array)
         )
 
+        if self.include_all_weights:
+            all_weights_and_particles = online_metric_list[0]
+            online_metric_list = online_metric_list[1:]
+
         # 2. Process output of scan.
         _, _, final_particles, final_log_weights = final_carry
         filter_diagnostics = {diagnostic_name: val for diagnostic_name, val in zip(self.category_two_metric_names + self.category_one_metric_names, online_metric_list)}
@@ -256,4 +267,7 @@ class ParticleFilter:
             # We are going to have issues as we need the previous particles, which we dont have without writing them into scan or terminating one early.
             # When re-writing terminate one step early.
 
-        return final_particles, final_log_weights, filter_diagnostics
+        if self.include_all_weights:
+            return final_particles, final_log_weights, filter_diagnostics, all_weights_and_particles
+        else:
+            return final_particles, final_log_weights, filter_diagnostics
